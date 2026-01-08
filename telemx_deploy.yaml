@@ -1,3 +1,5 @@
+#CloudFOrmation
+
 AWSTemplateFormatVersion: "2010-09-09"
 Description: "Real-time data pipeline: Kinesis Data Streams -> Lambda -> DynamoDB."
 
