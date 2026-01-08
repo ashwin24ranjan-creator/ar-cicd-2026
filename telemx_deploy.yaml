@@ -1,0 +1,129 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Real-time data pipeline: Kinesis Data Streams -> Lambda -> DynamoDB."
+
+Parameters:
+  StreamName:
+    Type: String
+    Default: telemx-stream
+
+  TableName:
+    Type: String
+    Default: telemx-events
+
+  LambdaFunctionName:
+    Type: String
+    Default: telemx-kinesis-to-ddb
+
+  ShardCount:
+    Type: Number
+    Default: 1
+
+  UserCreationRestrictionPolicyName:
+    Type: String
+    Default: usercreationrestriction
+    Description: "Exact IAM managed policy name allowed by the lab (as shown in IAM console)."
+
+Resources:
+  TelemaxStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Ref StreamName
+      ShardCount: !Ref ShardCount
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+
+  TelemaxTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  TelemaxLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${LambdaFunctionName}-role-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/${UserCreationRestrictionPolicyName}"
+
+  TelemaxLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt TelemaxLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+      Code:
+        ZipFile: |
+          """
+          Kinesis -> DynamoDB ingest Lambda.
+          Minimal required field: id (string).
+          """
+          import base64
+          import json
+          import os
+          from typing import Any, Dict, List
+
+          import boto3
+
+          _ddb = boto3.resource("dynamodb")
+          _table = _ddb.Table(os.environ["TABLE_NAME"])
+
+          def _to_ddb_item(payload: Dict[str, Any]) -> Dict[str, Any]:
+              if "id" not in payload or not isinstance(payload["id"], str) or not payload["id"]:
+                  raise ValueError("Missing/invalid 'id' in payload")
+              return payload
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              failures: List[Dict[str, str]] = []
+              with _table.batch_writer(overwrite_by_pkeys=["id"]) as batch:
+                  for rec in event.get("Records", []):
+                      seq = rec.get("kinesis", {}).get("sequenceNumber")
+                      try:
+                          raw = base64.b64decode(rec["kinesis"]["data"])
+                          payload = json.loads(raw.decode("utf-8"))
+                          batch.put_item(Item=_to_ddb_item(payload))
+                      except Exception:
+                          if seq:
+                              failures.append({"itemIdentifier": seq})
+              return {"batchItemFailures": failures}
+
+  TelemaxEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt TelemaxStream.Arn
+      FunctionName: !Ref TelemaxLambda
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 5
+      Enabled: true
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+Outputs:
+  KinesisStreamName:
+    Value: !Ref StreamName
+  DynamoTableName:
+    Value: !Ref TableName
+  LambdaName:
+    Value: !Ref TelemaxLambda
+  StreamArn:
+    Value: !GetAtt TelemaxStream.Arn
